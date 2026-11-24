@@ -28,7 +28,18 @@ sudo bash auditoria-seguridad.sh --informe ./audit-report.txt
 | `--kev` | Fetches the CISA Known Exploited Vulnerabilities catalog and checks a subset against available distribution data. Uses `curl` and `jq`. Ubuntu package lookups require the `pro` client. |
 | `--lynis` | Runs the optional Lynis quick audit when already installed. Lynis manages its own output and may write its own reports. |
 | `--informe FILE` | Writes a new plain-text report and refuses to overwrite an existing file. Use a private directory. |
+| `--json FILE` | Writes a shareable JSON summary without copying raw finding messages. Refuses to overwrite an existing file. |
 | `--help` | Shows usage. |
+
+### Share a JSON report and plan fixes
+
+~~~bash
+sudo bash auditoria-seguridad.sh --sin-red --json audit-share.json --informe audit-private.txt
+~~~
+
+The JSON records the distribution, audit mode, totals, and findings with severity, section, a check identifier and a public CVE identifier when available. Serious findings appear first. The report omits hostnames, usernames, local paths, ports, addresses and raw check text. Keep the text report private, and review the JSON before sharing it. Optional checks are marked as requested; this does not mean they ran successfully. Lynis's own findings are outside the JSON summary.
+
+Use the JSON to request a step-by-step plan. Start by validating pending updates and reboot status against the distribution's tools. Then review access and listening services, followed by file permissions and hardening settings. Use the check identifiers to match sections in the local text report when you need the exact item. Test changes in a VM and rerun the audit after each group of changes. The report does not apply any fixes.
 
 ### What each section checks
 
@@ -74,7 +85,18 @@ sudo bash auditoria-seguridad.sh --informe ./informe-auditoria.txt
 | `--kev` | Descarga el catálogo de vulnerabilidades explotadas conocidas de CISA y cruza un subconjunto con los datos disponibles. Usa `curl` y `jq`. En Ubuntu, la consulta de paquetes requiere el cliente `pro`. |
 | `--lynis` | Ejecuta la auditoría rápida opcional de Lynis si ya está instalado. Lynis gestiona su propia salida y puede escribir sus propios informes. |
 | `--informe ARCHIVO` | Escribe un informe nuevo en texto plano y rechaza sobrescribir un archivo existente. Usa un directorio privado. |
+| `--json ARCHIVO` | Escribe un resumen JSON para compartir sin copiar los mensajes originales de los hallazgos. Rechaza sobrescribir un archivo existente. |
 | `--help` | Muestra las opciones de uso. |
+
+### Comparte un informe JSON y prepara las correcciones
+
+~~~bash
+sudo bash auditoria-seguridad.sh --sin-red --json auditoria-compartir.json --informe auditoria-privada.txt
+~~~
+
+El JSON contiene la distribución, el modo de auditoría, los totales y los hallazgos con gravedad, sección, identificador de comprobación y un CVE público cuando está disponible. Los graves aparecen primero. El resumen omite nombres de máquina, usuarios, rutas locales, puertos, direcciones y mensajes originales. Guarda el informe de texto en privado y revisa el JSON antes de compartirlo. La marca de comprobación opcional indica que se solicitó. Los hallazgos propios de Lynis quedan fuera del resumen.
+
+Puedes pasar el JSON para pedir un plan paso a paso. Empieza por contrastar los parches y el reinicio pendiente con las herramientas de la distribución. Después revisa acceso y servicios en escucha, y sigue con permisos y endurecimiento. Cuando necesites el dato concreto, busca la misma sección en el informe de texto local. Prueba los cambios en una VM y repite la auditoría después de cada bloque. El informe no aplica correcciones.
 
 ### Qué comprueba cada sección
 
