@@ -8,7 +8,8 @@
 #     --kev        Cruza con el catálogo KEV de CISA (CVE explotados activamente)
 #     --lynis      Ejecuta Lynis al final si está instalado (auditoría extra)
 #     --sin-red    Omite consultas externas explícitas y usa caché local de DNF
-#     --informe F  Guarda además el informe (sin colores) en el fichero F
+#     --informe F  Guarda el informe de texto detallado en un fichero nuevo
+#     --json F     Guarda un resumen compartible en JSON en un fichero nuevo
 #
 #  No aplica cambios de configuración ni reinicia. Puede actualizar cachés.
 #  Código de salida: 0 = sin hallazgos, 1 = avisos, 2 = fallos graves, 3 = error de uso
@@ -23,21 +24,21 @@ set -uo pipefail
 export LC_ALL=C
 
 # ---------- Opciones ---------------------------------------------------------
-USAR_KEV=0; USAR_LYNIS=0; SIN_RED=0; INFORME=""
+USAR_KEV=0; USAR_LYNIS=0; SIN_RED=0; INFORME=""; JSON=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --kev) USAR_KEV=1 ;;
     --lynis) USAR_LYNIS=1 ;;
     --sin-red) SIN_RED=1 ;;
-    --informe)
+    --informe|--json)
       if [[ -z ${2:-} || $2 == --* ]]; then
-        echo "Falta la ruta para --informe" >&2
+        echo "Falta la ruta para $1" >&2
         exit 3
       fi
-      INFORME=$2
+      if [[ $1 == --json ]]; then JSON=$2; else INFORME=$2; fi
       shift
       ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "Opción desconocida: $1" >&2; exit 3 ;;
   esac
   shift
@@ -52,17 +53,76 @@ if [[ -n "$INFORME" ]]; then
   exec 3>&-
 fi
 
+if [[ -n "$JSON" ]]; then
+  umask 077
+  set -o noclobber
+  if ! { exec 4>"$JSON"; }; then exit 3; fi
+  set +o noclobber
+fi
+
 # ---------- Salida -----------------------------------------------------------
 if [[ -t 1 && -z "$INFORME" ]]; then
   R=$'\e[31m'; V=$'\e[32m'; A=$'\e[33m'; B=$'\e[1m'; G=$'\e[2m'; F=$'\e[0m'
 else R=""; V=""; A=""; B=""; G=""; F=""; fi
 
 N_OK=0; N_AV=0; N_MAL=0
+SECCION=""
+declare -a HALLAZGOS=()
+
+registrar_hallazgo() {
+  [[ -n "$JSON" && -n "$SECCION" ]] || return 0
+  local gravedad=$1 mensaje=$2 control=$SECCION cve=""
+  # Solo se guardan identificadores de controles y CVE, nunca el mensaje.
+  case "$SECCION:$mensaje" in
+    kernel:*'NO arrancado'*|kernel:*'reinicio'*) control=reboot_pending ;;
+    updates:*'sin verificar'*) control=package_query_unverified ;;
+    updates:*'pendientes'*|updates:*'avisos de seguridad en APT'*) control=security_updates_pending ;;
+    updates:*'automáticas'*) control=automatic_updates ;;
+    ssh:Root*|ssh:PermitRootLogin*) control=ssh_root_login ;;
+    ssh:PasswordAuthentication*|ssh:PermitEmptyPasswords*) control=ssh_password_policy ;;
+    ssh:*'configuración efectiva'*) control=ssh_config_unverified ;;
+    network:*cortafuegos*) control=firewall_detection ;;
+    network:*'todas las interfaces'*) control=listener_reachability ;;
+    permissions:SUID*|permissions:Capability*) control=privileged_files ;;
+  esac
+  if [[ $SECCION == published_cves || $SECCION == cisa_kev ]]; then
+    if [[ $mensaje =~ (CVE-[0-9]{4}-[0-9]{4,}) ]]; then cve=${BASH_REMATCH[1]}; fi
+  fi
+  HALLAZGOS+=("$gravedad|$SECCION|$control|$cve")
+}
+
 ok()   { echo "  ${V}[ OK ]${F} $*"; N_OK=$((N_OK+1)); }
-av()   { echo "  ${A}[AVISO]${F} $*"; N_AV=$((N_AV+1)); }
-mal()  { echo "  ${R}[ MAL ]${F} $*"; N_MAL=$((N_MAL+1)); }
+av()   { echo "  ${A}[AVISO]${F} $*"; N_AV=$((N_AV+1)); registrar_hallazgo warning "$*"; }
+mal()  { echo "  ${R}[ MAL ]${F} $*"; N_MAL=$((N_MAL+1)); registrar_hallazgo serious "$*"; }
 info() { echo "  ${G}·${F} $*"; }
-tit()  { echo; echo "${B}━━ $* ━━${F}"; }
+tit()  { SECCION=${2:-}; echo; echo "${B}━━ $1 ━━${F}"; }
+
+escribir_json() {
+  local estado=$1 familia=$FAM distro=$ID version=${VERSION_ID:-}
+  local privilegiado=false sin_red=false kev=false lynis=false separador="" prioridad hallazgo nivel seccion control cve
+  (( EUID == 0 )) && privilegiado=true
+  (( SIN_RED )) && sin_red=true
+  (( USAR_KEV )) && kev=true
+  (( USAR_LYNIS )) && lynis=true
+  # Los valores de distribución se limitan a caracteres seguros para JSON.
+  [[ $distro =~ ^[a-zA-Z0-9._-]+$ ]] || distro=unknown
+  [[ $version =~ ^[a-zA-Z0-9._-]+$ ]] || version=unknown
+  printf '{\n  "schema_version": 1,\n  "distribution": {"id": "%s", "version": "%s", "family": "%s"},\n' "$distro" "$version" "$familia" || return 1
+  printf '  "root": %s,\n  "cache_only": %s,\n  "exit_code": %d,\n' "$privilegiado" "$sin_red" "$estado" || return 1
+  printf '  "optional_checks_requested": {"cisa_kev": %s, "lynis": %s},\n' "$kev" "$lynis" || return 1
+  printf '  "counts": {"ok": %d, "warnings": %d, "serious": %d},\n  "findings": [' "$N_OK" "$N_AV" "$N_MAL" || return 1
+  for prioridad in serious warning; do
+    for hallazgo in "${HALLAZGOS[@]}"; do
+      IFS='|' read -r nivel seccion control cve <<< "$hallazgo"
+      [[ $nivel == "$prioridad" ]] || continue
+      printf '%s\n    {"severity": "%s", "section": "%s", "check": "%s"' "$separador" "$nivel" "$seccion" "$control" || return 1
+      if [[ -n $cve ]]; then printf ', "cve": "%s"' "$cve" || return 1; fi
+      printf '}' || return 1
+      separador=,
+    done
+  done
+  printf '\n  ]\n}\n'
+}
 tiene(){ command -v "$1" >/dev/null 2>&1; }
 
 dnf_auditoria() {
@@ -130,7 +190,7 @@ esac
 echo "${B}Auditoría de seguridad${F} — $(hostname) — ${PRETTY_NAME} — $(date '+%Y-%m-%d %H:%M')"
 
 # =============================================================================
-tit "1. Sistema operativo y soporte"
+tit "1. Sistema operativo y soporte" os_support
 # =============================================================================
 if [[ $FAM == deb && $ID == ubuntu ]]; then
   if tiene ubuntu-distro-info; then
@@ -148,7 +208,7 @@ elif [[ $ID == fedora ]]; then
 fi
 
 # =============================================================================
-tit "2. Kernel (la vía de los 'root' de las noticias)"
+tit "2. Kernel (la vía de los 'root' de las noticias)" kernel
 # =============================================================================
 EN_USO=$(uname -r)
 if [[ $FAM == deb ]]; then
@@ -198,7 +258,7 @@ elif [[ $FAM == rpm ]] && tiene kpatch; then
 fi
 
 # =============================================================================
-tit "3. Parches de seguridad pendientes"
+tit "3. Parches de seguridad pendientes" updates
 # =============================================================================
 if [[ $FAM == deb ]]; then
   if ! (( SIN_RED )) && ! apt-get -o APT::Update::Error-Mode=any update -qq >/dev/null 2>&1; then
@@ -246,7 +306,7 @@ else
 fi
 
 # =============================================================================
-tit "4. Endurecimiento del kernel (frena exploits de escalada local)"
+tit "4. Endurecimiento del kernel (frena exploits de escalada local)" kernel_hardening
 # =============================================================================
 sysctl_chk() { # clave valor_bueno severidad explicación
   local v; v=$(sysctl -n "$1" 2>/dev/null) || { info "$1 no existe en este kernel"; return; }
@@ -300,7 +360,7 @@ if grep -qw lockdown /sys/kernel/security/lsm 2>/dev/null; then
 fi
 
 # =============================================================================
-tit "5. SELinux / AppArmor"
+tit "5. SELinux / AppArmor" mandatory_access_control
 # =============================================================================
 if tiene getenforce; then
   case "$(getenforce)" in
@@ -318,7 +378,7 @@ else
 fi
 
 # =============================================================================
-tit "6. Usuarios, contraseñas y sudo"
+tit "6. Usuarios, contraseñas y sudo" accounts_and_sudo
 # =============================================================================
 UID0=$(awk -F: '$3==0 {print $1}' /etc/passwd | grep -vx root || true)
 [[ -n "$UID0" ]] && mal "Otras cuentas con UID 0 (son root): $UID0" || ok "Solo 'root' tiene UID 0"
@@ -357,7 +417,7 @@ if tiene sudo; then
 fi
 
 # =============================================================================
-tit "7. SSH"
+tit "7. SSH" ssh
 # =============================================================================
 if tiene sshd; then
   # OpenSSH >= 10.5 imprime las claves con mayúsculas: normalizamos a minúsculas
@@ -387,7 +447,7 @@ elif systemctl is-active crowdsec >/dev/null 2>&1; then ok "CrowdSec activo"
 else av "Sin fail2ban/CrowdSec contra fuerza bruta"; fi
 
 # =============================================================================
-tit "8. Red y servicios expuestos"
+tit "8. Red y servicios expuestos" network
 # =============================================================================
 if systemctl is-active firewalld >/dev/null 2>&1; then
   ok "firewalld activo (zona por defecto: $(firewall-cmd --get-default-zone 2>/dev/null))"
@@ -407,7 +467,7 @@ if tiene ss; then
 fi
 
 # =============================================================================
-tit "9. Ficheros y permisos peligrosos"
+tit "9. Ficheros y permisos peligrosos" permissions
 # =============================================================================
 if [[ $EUID -eq 0 ]]; then
   # Binarios SUID/SGID conocidos por permitir saltar a root si están mal (GTFOBins)
@@ -471,7 +531,7 @@ for mp in /tmp /dev/shm /var/tmp; do
 done
 
 # =============================================================================
-tit "10. Registro y detección"
+tit "10. Registro y detección" logging
 # =============================================================================
 systemctl is-active auditd >/dev/null 2>&1 && ok "auditd activo" || av "auditd no activo (sin registro de auditoría)"
 if tiene aide || tiene tripwire; then ok "Control de integridad (AIDE/Tripwire) instalado"
@@ -486,7 +546,7 @@ if tiene journalctl; then
 fi
 
 # =============================================================================
-tit "11. Vías de root publicadas en 2026 (0-day y explotadas activamente)"
+tit "11. Vías de root publicadas en 2026 (0-day y explotadas activamente)" published_cves
 # =============================================================================
 info "Lista fija revisada el ${DATOS_0DAY}. Un 0-day sin publicar no se detecta: aquí se mira lo ya conocido y la superficie que suelen usar"
 DIAS_LISTA=$(( ( $(date +%s) - $(date -d "$DATOS_0DAY" +%s) ) / 86400 ))
@@ -638,7 +698,7 @@ fi
 
 # =============================================================================
 if (( USAR_KEV )); then
-tit "12. CVE explotados activamente (catálogo KEV de CISA)"
+tit "12. CVE explotados activamente (catálogo KEV de CISA)" cisa_kev
 # =============================================================================
   URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
   if (( SIN_RED )); then info "Omitido por --sin-red"
@@ -668,7 +728,7 @@ fi
 
 # =============================================================================
 if (( USAR_LYNIS )); then
-tit "13. Lynis"
+tit "13. Lynis" lynis
   if (( SIN_RED )); then info "Lynis omitido por --sin-red"
   elif tiene lynis; then lynis audit system --quick --no-colors 2>/dev/null | sed -n '/Lynis security scan details/,$p'
   else av "Lynis no instalado (apt/dnf install lynis)"; fi
@@ -678,9 +738,20 @@ fi
 tit "RESUMEN"
 echo "  ${V}OK: $N_OK${F}   ${A}Avisos: $N_AV${F}   ${R}Fallos: $N_MAL${F}"
 if (( N_MAL > 0 )); then
-  echo "  ${R}Hay fallos graves. Empieza por: parches pendientes → reiniciar → SSH → SUID.${F}"; exit 2
+  echo "  ${R}Hay fallos graves. Empieza por: parches pendientes → reiniciar → SSH → SUID.${F}"
+  ESTADO=2
 elif (( N_AV > 0 )); then
-  echo "  ${A}Sin fallos graves, pero hay avisos que conviene revisar.${F}"; exit 1
+  echo "  ${A}Sin fallos graves, pero hay avisos que conviene revisar.${F}"
+  ESTADO=1
 else
-  echo "  ${V}Todo correcto en lo que este script puede comprobar.${F}"; exit 0
+  echo "  ${V}Todo correcto en lo que este script puede comprobar.${F}"
+  ESTADO=0
 fi
+if [[ -n "$JSON" ]]; then
+  if ! escribir_json "$ESTADO" >&4; then
+    echo "No se pudo completar el informe JSON" >&2
+    exit 3
+  fi
+  exec 4>&-
+fi
+exit "$ESTADO"
